@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net/http"
@@ -22,6 +23,15 @@ import (
 const DEFAULT_PAGE_LENGTH = 10
 const DEFAULT_MAX_DEPTH = 1
 const DEFAULT_BITBUCKET_API_BASE_URL = "https://api.bitbucket.org/2.0"
+
+type Response struct {
+	Size     int           `json:"size"`
+	Page     int           `json:"page"`
+	Pagelen  int           `json:"pagelen"`
+	Next     string        `json:"next"`
+	Previous string        `json:"previous"`
+	Values   []interface{} `json:"values"`
+}
 
 func apiBaseUrl() (*url.URL, error) {
 	ev := os.Getenv("BITBUCKET_API_BASE_URL")
@@ -224,49 +234,47 @@ func (c *Client) execute(method string, urlStr string, text string) (interface{}
 	}
 
 	c.authenticateRequest(req)
-	result, err := c.doRequest(req, false)
+	respBytes, err := c.doRequest(req, false)
 	if err != nil {
 		return nil, err
 	}
 
-	//autopaginate.
-	resultMap, isMap := result.(map[string]interface{})
-	if isMap {
-		nextIn := resultMap["next"]
-		valuesIn := resultMap["values"]
-		if nextIn != nil && valuesIn != nil {
-			nextUrl := nextIn.(string)
-			if nextUrl != "" {
-				valuesSlice := valuesIn.([]interface{})
-				if valuesSlice != nil {
-					nextResult, err := c.execute(method, nextUrl, text)
-					if err != nil {
-						return nil, err
-					}
-					nextResultMap, isNextMap := nextResult.(map[string]interface{})
-					if !isNextMap {
-						return nil, fmt.Errorf("next page result is not map, it's %T", nextResult)
-					}
-					nextValuesIn := nextResultMap["values"]
-					if nextValuesIn == nil {
-						return nil, fmt.Errorf("next page result has no values")
-					}
-					nextValuesSlice, isSlice := nextValuesIn.([]interface{})
-					if !isSlice {
-						return nil, fmt.Errorf("next page result 'values' is not slice")
-					}
-					valuesSlice = append(valuesSlice, nextValuesSlice...)
-					resultMap["values"] = valuesSlice
-					delete(resultMap, "page")
-					delete(resultMap, "pagelen")
-					delete(resultMap, "max_depth")
-					delete(resultMap, "size")
-					result = resultMap
-				}
+	var paginatedResult *Response
+	err = json.Unmarshal(respBytes, paginatedResult)
+	if err != nil {
+		return nil, err
+	}
+	if len(paginatedResult.Values) > 0 {
+		var values []interface{}
+		for {
+			values = append(values, paginatedResult.Values...)
+			if len(paginatedResult.Next) == 0 {
+				break
 			}
+			req, err := http.NewRequest(method, paginatedResult.Next, nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := c.doRequest(req, false)
+			err = json.Unmarshal(resp, paginatedResult)
+			if err != nil {
+				return nil, err
+			}
+		}
+		resultTemplate := &Response{
+			Values: values,
+		}
+		respBytes, err = json.Marshal(resultTemplate)
+		if err != nil {
+			return nil, err
 		}
 	}
 
+	// Result is not paginated, so pass it through as normal.
+	var result interface{}
+	if err := json.Unmarshal(respBytes, result); err != nil {
+		log.Println("Could not unmarshal JSON payload, returning raw response")
+	}
 	return result, nil
 }
 
@@ -327,7 +335,7 @@ func (c *Client) authenticateRequest(req *http.Request) {
 	return
 }
 
-func (c *Client) doRequest(req *http.Request, emptyResponse bool) (interface{}, error) {
+func (c *Client) doRequest(req *http.Request, emptyResponse bool) ([]byte, error) {
 	resBody, err := c.doRawRequest(req, emptyResponse)
 	if err != nil {
 		return nil, err
@@ -338,13 +346,7 @@ func (c *Client) doRequest(req *http.Request, emptyResponse bool) (interface{}, 
 
 	defer resBody.Close()
 
-	var result interface{}
-	if err := json.NewDecoder(resBody).Decode(&result); err != nil {
-		log.Println("Could not unmarshal JSON payload, returning raw response")
-		return resBody, err
-	}
-
-	return result, nil
+	return ioutil.ReadAll(resBody)
 }
 
 func (c *Client) doRawRequest(req *http.Request, emptyResponse bool) (io.ReadCloser, error) {
